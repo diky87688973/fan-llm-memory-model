@@ -21,6 +21,10 @@
 ├── tools/     独立工具
 │   ├── memory_session_raw_merge.py  原始会话语料合并
 │   └── session_corpus_duplicate.py  语料去重
+├── train/     训练（LoRA 微调 / 回放式增量）
+│   ├── train_memory.py           全量记忆 LoRA 训练（session_raw 全日期汇总）
+│   ├── train_memory_replay.py    回放式增量训练（当日全量 + 历史 5% 抽样）
+│   └── train_memory_utils.py     训练专用工具（qa/raw 消息构造、保存、token 统计）
 ├── web/       chat_ui.html（浏览器对话页）
 ├── docs/      方案设计文档
 └── requirements.txt
