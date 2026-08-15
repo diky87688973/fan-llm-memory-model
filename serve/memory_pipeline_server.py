@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-记忆模型-chat HTTP 服务：维护会话多轮 history，在服务端写入 ``session_staging/<用户ID>/``（用户 ID 与展示名见 Cookie）；
+记忆模型-chat HTTP 服务：维护会话多轮 history，在服务端写入 ``session_staging/``；
 每轮将完整对话以 OpenAI messages 交给路由与终答模型；终答支持 DeepSeek 流式（SSE）。
 浏览器访问根路径 ``GET /`` 可得同 API 的流式（或整段）对话页。
 
@@ -20,24 +20,22 @@ import argparse
 import json
 import os
 import socket
-import uuid
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import quote, unquote
 
-from fastapi import Body, FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 import memory_pipeline_core as mpc
-import memory_user_paths as mem_paths
+from memory_session_id import is_valid_session_id, next_session_id
 
 _script_dir = Path(__file__).resolve().parent
 
 BUILTIN_HOST = "::"
 BUILTIN_PORT = 8890
 BUILTIN_SESSION_STAGING_DIR = str(_script_dir / "session_staging")
-_SESSION_DATA_DIR = _script_dir / "session"
+_SESSION_DATA_DIR = _script_dir / "session_raw"
 _SESSION_CHAT_DIR = _script_dir / "session_chat"
 
 _CHAT_UI_HTML_PATH = _script_dir / "chat_ui.html"
@@ -49,23 +47,16 @@ class SessionState:
     def __init__(self, session_id: str) -> None:
         self.session_id: str = session_id
         self.history: list[tuple[str, str]] = []
-        self.session_memory_retrieval_blocks: list[str] = []
-        self.session_profile_fks: set[str] = set()
         self.staging_path: Path | None = None
         self.chat_dump_path: Path | None = None
         self.created_at: datetime = datetime.now()
-        self.user_id: str = ""
-        self.display_name: str = "User"
 
 
 SESSIONS: dict[str, SessionState] = {}
 
 
-def _safe_session_raw_path(rel: str, request: Request) -> Path:
-    """``rel`` 为相对 ``session/`` 的路径（POSIX），仅允许 ``*.raw.txt``，且仅当前 cookie 用户目录下。"""
-    uid = _cookie_user_id(request)
-    if not uid:
-        raise HTTPException(status_code=400, detail="缺少用户标识 cookie")
+def _safe_session_raw_path(rel: str) -> Path:
+    """``rel`` 为相对 ``session_raw/`` 的路径（POSIX），仅允许 ``*.raw.txt``。"""
     if not rel or not isinstance(rel, str):
         raise HTTPException(status_code=400, detail="缺少路径")
     rel = rel.strip().replace("\\", "/").lstrip("/")
@@ -74,12 +65,9 @@ def _safe_session_raw_path(rel: str, request: Request) -> Path:
     root = _SESSION_DATA_DIR.resolve()
     p = (root / rel).resolve()
     try:
-        rel_to_root = p.relative_to(root)
+        p.relative_to(root)
     except ValueError:
         raise HTTPException(status_code=400, detail="非法路径")
-    parts = rel_to_root.parts
-    if not parts or parts[0] != uid:
-        raise HTTPException(status_code=403, detail="无权访问该路径")
     if not p.name.endswith(".raw.txt"):
         raise HTTPException(status_code=400, detail="仅支持 .raw.txt")
     if not p.is_file():
@@ -91,33 +79,16 @@ def _session_staging_root() -> Path:
     return Path(BUILTIN_SESSION_STAGING_DIR).resolve()
 
 
-def _cookie_user_id(request: Request) -> str:
-    ck = (request.cookies.get(mem_paths.COOKIE_USER_ID) or "").strip()
-    return mem_paths.sanitize_path_user_id(ck) if ck else ""
-
-
-def _cookie_display_name(request: Request) -> str:
-    raw = request.cookies.get(mem_paths.COOKIE_DISPLAY_NAME) or ""
-    try:
-        s = unquote(raw).strip()
-    except Exception:
-        s = (raw or "").strip()
-    return s
-
-
-def _safe_staging_file_basename(request: Request, name: str) -> Path:
+def _safe_staging_file_basename(name: str) -> Path:
     if not name or not isinstance(name, str):
         raise HTTPException(status_code=400, detail="缺少文件名")
     base = Path(name.strip().replace("\\", "/")).name
     if not base or ".." in base:
         raise HTTPException(status_code=400, detail="非法文件名")
-    uid = _cookie_user_id(request)
-    if not uid:
-        raise HTTPException(status_code=400, detail="缺少用户标识 cookie，请刷新页面后先完成用户名设置")
-    root = mem_paths.session_staging_user_dir(_session_staging_root(), uid)
+    root = _session_staging_root()
     p = (root / base).resolve()
     try:
-        p.relative_to(root.resolve())
+        p.relative_to(root)
     except ValueError:
         raise HTTPException(status_code=400, detail="非法文件名")
     if not p.is_file():
@@ -129,10 +100,10 @@ def _session_chat_root() -> Path:
     return _SESSION_CHAT_DIR.resolve()
 
 
-def _new_chat_dump_path(user_id: str, session_id: str) -> Path:
-    d = mem_paths.session_chat_user_dir(_SESSION_CHAT_DIR, user_id)
+def _new_chat_dump_path(session_id: str) -> Path:
+    _SESSION_CHAT_DIR.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return d / f"chat_{ts}_{session_id}.json"
+    return _SESSION_CHAT_DIR / f"chat_{ts}_{session_id}.json"
 
 
 def _write_json_atomic(path: Path, doc: dict) -> None:
@@ -141,12 +112,10 @@ def _write_json_atomic(path: Path, doc: dict) -> None:
     tmp.replace(path)
 
 
-def _session_chat_init_file(path: Path, session_id: str, *, user_id: str, display_name: str) -> None:
+def _session_chat_init_file(path: Path, session_id: str) -> None:
     doc = {
         "format": 1,
         "session_id": session_id,
-        "memory_user_id": user_id,
-        "display_name": display_name,
         "created_at": datetime.now().replace(microsecond=0).isoformat(sep=" "),
         "turns": [],
     }
@@ -161,64 +130,26 @@ def _session_chat_append_turn(path: Path, turn: dict) -> None:
     _write_json_atomic(path, doc)
 
 
-def _session_chat_append_turn_for_session(st: SessionState, turn: dict) -> None:
-    """首轮对话前才创建 ``chat_*.json``；无对话则不落盘。"""
-    if st.chat_dump_path is None:
-        return
-    p = st.chat_dump_path
-    if not p.is_file():
-        _session_chat_init_file(p, st.session_id, user_id=st.user_id, display_name=st.display_name)
-    _session_chat_append_turn(p, turn)
-
-
-def _find_staging_for_session(session_id: str, user_id: str) -> Path | None:
-    root = _session_staging_root()
-    if not root.is_dir():
+def _find_staging_for_session(session_id: str) -> Path | None:
+    d = Path(BUILTIN_SESSION_STAGING_DIR)
+    if not d.is_dir():
         return None
-    patterns = (f"session_*_{session_id}.txt", f"cli_*_{session_id}.txt")
-
-    def _pick_newest_under(search_dir: Path) -> Path | None:
-        if not search_dir.is_dir():
-            return None
-        candidates: list[Path] = []
-        for pat in patterns:
-            for p in search_dir.glob(pat):
-                if p.is_file():
-                    candidates.append(p)
-        if not candidates:
-            return None
-        candidates.sort(key=lambda x: x.stat().st_mtime, reverse=True)
-        return candidates[0]
-
-    if user_id:
-        ud = mem_paths.session_staging_user_dir(root, user_id)
-        hit = _pick_newest_under(ud)
-        if hit is not None:
-            return hit
-    candidates: list[Path] = []
-    for pat in patterns:
-        for p in root.rglob(pat):
-            if p.is_file():
-                candidates.append(p)
-    if not candidates:
-        return None
-    candidates.sort(key=lambda x: x.stat().st_mtime, reverse=True)
-    return candidates[0]
+    for p in sorted(d.glob(f"cli_*_{session_id}.txt"), key=lambda x: x.stat().st_mtime, reverse=True):
+        if p.is_file():
+            return p
+    return None
 
 
-def _safe_session_chat_basename(request: Request, name: str) -> Path:
+def _safe_session_chat_basename(name: str) -> Path:
     if not name or not isinstance(name, str):
         raise HTTPException(status_code=400, detail="缺少文件名")
     base = Path(name.strip().replace("\\", "/")).name
     if not base.endswith(".json") or ".." in base:
         raise HTTPException(status_code=400, detail="非法文件名")
-    uid = _cookie_user_id(request)
-    if not uid:
-        raise HTTPException(status_code=400, detail="缺少用户标识 cookie")
-    root = mem_paths.session_chat_user_dir(_SESSION_CHAT_DIR, uid)
+    root = _session_chat_root()
     p = (root / base).resolve()
     try:
-        p.relative_to(root.resolve())
+        p.relative_to(root)
     except ValueError:
         raise HTTPException(status_code=400, detail="非法文件名")
     if not p.is_file():
@@ -255,17 +186,17 @@ def _turns_out_from_file_doc(turns_raw: object) -> tuple[list[dict], list[tuple[
     return turns_out, history
 
 
-def _new_staging_path(user_id: str, session_id: str) -> Path:
-    """``session_staging/<user_id>/session_<时间>_<session_id>.txt``。"""
-    d = mem_paths.session_staging_user_dir(_session_staging_root(), user_id)
+def _new_staging_path(session_id: str) -> Path:
+    """与 HTTP ``session_id`` 一致：``session_staging/cli_<时间>_<session_id>.txt``，便于目录内检索。"""
+    d = Path(BUILTIN_SESSION_STAGING_DIR)
     d.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return d / f"session_{ts}_{session_id}.txt"
+    return d / f"cli_{ts}_{session_id}.txt"
 
 
-class CreateSessionRequest(BaseModel):
-    user_id: str = ""
-    display_name: str = ""
+class CreateSessionResponse(BaseModel):
+    session_id: str
+    llm_model: str
 
 
 class ChatRequest(BaseModel):
@@ -344,48 +275,18 @@ def create_app(
             media_type="text/plain; charset=utf-8",
         )
 
-    @app.post("/sessions")
-    def create_session(request: Request, body: CreateSessionRequest = Body()):
-        uid_raw = (body.user_id or request.cookies.get(mem_paths.COOKIE_USER_ID) or "").strip()
-        if not uid_raw:
-            uid_raw = mem_paths.generate_new_user_id()
-            set_uid_cookie = True
-        else:
-            set_uid_cookie = False
-        uid_s = mem_paths.sanitize_path_user_id(uid_raw)
-        name = (body.display_name or _cookie_display_name(request) or "").strip()
-        if not name:
-            name = "User"
-        sid = uuid.uuid4().hex
+    @app.post("/sessions", response_model=CreateSessionResponse)
+    def create_session():
+        sid = next_session_id()
         st = SessionState(sid)
-        st.user_id = uid_s
-        st.display_name = name
         if mpc.BUILTIN_SAVE_SESSION_STAGING:
-            st.staging_path = _new_staging_path(uid_s, sid)
-        st.chat_dump_path = _new_chat_dump_path(uid_s, sid)
+            st.staging_path = _new_staging_path(sid)
+        st.chat_dump_path = _new_chat_dump_path(sid)
+        _session_chat_init_file(st.chat_dump_path, sid)
         SESSIONS[sid] = st
-        payload = {
-            "session_id": sid,
-            "user_id": uid_s,
-            "llm_model": _effective_llm_model_label(),
-        }
-        resp = JSONResponse(content=payload)
-        if set_uid_cookie:
-            resp.set_cookie(
-                mem_paths.COOKIE_USER_ID,
-                uid_s,
-                max_age=365 * 86400,
-                path="/",
-                samesite="lax",
-            )
-        resp.set_cookie(
-            mem_paths.COOKIE_DISPLAY_NAME,
-            quote(name, safe=""),
-            max_age=365 * 86400,
-            path="/",
-            samesite="lax",
+        return CreateSessionResponse(
+            session_id=sid, llm_model=_effective_llm_model_label()
         )
-        return resp
 
     @app.post("/sessions/{session_id}/chat")
     def chat(session_id: str, body: ChatRequest):
@@ -418,9 +319,6 @@ def create_app(
                         timeout_sec=timeout_sec,
                         ollama_think=ollama_think,
                         dump_llm_requests=False,
-                        memory_user_id=st.user_id,
-                        session_profile_fks=st.session_profile_fks,
-                        session_memory_retrieval_blocks=st.session_memory_retrieval_blocks,
                     ):
                         yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
                         k = ev.get("kind")
@@ -445,19 +343,19 @@ def create_app(
                             msg,
                             full,
                             turn_time=datetime.now().replace(microsecond=0),
-                            user_speaker_label=st.display_name,
                         )
                     st.history.append((msg, full))
-                    _session_chat_append_turn_for_session(
-                        st,
-                        {
-                            "user": msg,
-                            "think": "".join(think_concat_parts).strip(),
-                            "think_events": think_events,
-                            "stream_deltas": delta_chunks,
-                            "assistant": full,
-                        },
-                    )
+                    if st.chat_dump_path is not None:
+                        _session_chat_append_turn(
+                            st.chat_dump_path,
+                            {
+                                "user": msg,
+                                "think": "".join(think_concat_parts).strip(),
+                                "think_events": think_events,
+                                "stream_deltas": delta_chunks,
+                                "assistant": full,
+                            },
+                        )
                     yield "data: [DONE]\n\n"
                 except Exception as e:
                     yield f"data: {json.dumps({'error': str(e)}, ensure_ascii=False)}\n\n"
@@ -486,9 +384,6 @@ def create_app(
                 timeout_sec=timeout_sec,
                 ollama_think=ollama_think,
                 dump_llm_requests=False,
-                memory_user_id=st.user_id,
-                session_profile_fks=st.session_profile_fks,
-                session_memory_retrieval_blocks=st.session_memory_retrieval_blocks,
             )
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e)) from e
@@ -498,37 +393,28 @@ def create_app(
                 msg,
                 out,
                 turn_time=datetime.now().replace(microsecond=0),
-                user_speaker_label=st.display_name,
             )
         st.history.append((msg, out))
-        _session_chat_append_turn_for_session(
-            st,
-            {
-                "user": msg,
-                "think": "",
-                "think_events": [],
-                "stream_deltas": [],
-                "assistant": out,
-            },
-        )
+        if st.chat_dump_path is not None:
+            _session_chat_append_turn(
+                st.chat_dump_path,
+                {
+                    "user": msg,
+                    "think": "",
+                    "think_events": [],
+                    "stream_deltas": [],
+                    "assistant": out,
+                },
+            )
         return {"reply": out}
 
     @app.get("/memory-bank/raw-files")
-    def list_session_raw_files(request: Request):
-        """仅当前 cookie 用户的 ``session/<user_id>/`` 下 ``*.raw.txt``。"""
-        uid = _cookie_user_id(request)
-        if not uid:
-            return {"files": []}
+    def list_session_raw_files():
         root = _SESSION_DATA_DIR.resolve()
-        user_dir = (root / uid).resolve()
-        try:
-            user_dir.relative_to(root)
-        except ValueError:
-            return {"files": []}
-        if not user_dir.is_dir():
+        if not root.is_dir():
             return {"files": []}
         files: list[dict[str, str | int]] = []
-        for p in user_dir.rglob("*.raw.txt"):
+        for p in root.rglob("*.raw.txt"):
             if not p.is_file():
                 continue
             rel = p.relative_to(root).as_posix()
@@ -538,8 +424,8 @@ def create_app(
         return {"files": files}
 
     @app.get("/memory-bank/raw-content")
-    def get_session_raw_content(request: Request, rel: str):
-        p = _safe_session_raw_path(rel, request)
+    def get_session_raw_content(rel: str):
+        p = _safe_session_raw_path(rel)
         return Response(
             content=p.read_text(encoding="utf-8"),
             media_type="text/plain; charset=utf-8",
@@ -547,12 +433,9 @@ def create_app(
         )
 
     @app.get("/today-sessions")
-    def list_session_staging_files(request: Request):
-        """当前 cookie 对应用户的 ``session_staging/<user_id>/`` 下文件。"""
-        uid = _cookie_user_id(request)
-        if not uid:
-            return {"files": []}
-        root = mem_paths.session_staging_user_dir(_session_staging_root(), uid)
+    def list_session_staging_files():
+        """``session_staging/`` 目录下所有普通文件（非递归）。"""
+        root = Path(BUILTIN_SESSION_STAGING_DIR)
         if not root.is_dir():
             return {"files": []}
         rows: list[dict[str, str | int]] = []
@@ -565,8 +448,8 @@ def create_app(
         return {"files": rows}
 
     @app.get("/today-session-content")
-    def get_session_staging_content(request: Request, name: str):
-        p = _safe_staging_file_basename(request, name)
+    def get_session_staging_content(name: str):
+        p = _safe_staging_file_basename(name)
         return Response(
             content=p.read_text(encoding="utf-8", errors="replace"),
             media_type="text/plain; charset=utf-8",
@@ -574,11 +457,8 @@ def create_app(
         )
 
     @app.get("/session-chat/files")
-    def list_session_chat_files(request: Request):
-        uid = _cookie_user_id(request)
-        if not uid:
-            return {"files": []}
-        root = mem_paths.session_chat_user_dir(_SESSION_CHAT_DIR, uid)
+    def list_session_chat_files():
+        root = _SESSION_CHAT_DIR.resolve()
         if not root.is_dir():
             return {"files": []}
         rows: list[dict[str, str | int]] = []
@@ -591,13 +471,13 @@ def create_app(
         return {"files": rows}
 
     @app.post("/session-chat/open")
-    def session_chat_open(request: Request, body: OpenSessionChatBody):
-        p = _safe_session_chat_basename(request, body.filename)
+    def session_chat_open(body: OpenSessionChatBody):
+        p = _safe_session_chat_basename(body.filename)
         doc = json.loads(p.read_text(encoding="utf-8"))
         if doc.get("format") != 1:
             raise HTTPException(status_code=400, detail="不支持的 session_chat 格式")
         sid = str(doc.get("session_id") or "").strip().lower()
-        if len(sid) != 32 or any(c not in "0123456789abcdef" for c in sid):
+        if not is_valid_session_id(sid):
             raise HTTPException(status_code=400, detail="文件缺少有效 session_id")
         turns_raw = doc.get("turns")
         if not isinstance(turns_raw, list):
@@ -624,16 +504,7 @@ def create_app(
                 detail="该会话已在服务内存中（且不是当前 JSON 文件），请关闭其它占用后重试",
             )
 
-        uid_doc = str(doc.get("memory_user_id") or "").strip()
-        uid_s = mem_paths.sanitize_path_user_id(uid_doc) if uid_doc else _cookie_user_id(request)
-        if not uid_s:
-            uid_s = mem_paths.sanitize_path_user_id(mem_paths.generate_new_user_id())
-        dname = str(doc.get("display_name") or "").strip()
-        if not dname:
-            dname = _cookie_display_name(request) or "User"
         rst = SessionState(sid)
-        rst.user_id = uid_s
-        rst.display_name = dname
         rst.chat_dump_path = p
         ca = doc.get("created_at")
         if isinstance(ca, str):
@@ -647,9 +518,9 @@ def create_app(
                     rst.created_at = datetime.now()
         for pair in hist_pairs:
             rst.history.append(pair)
-        rst.staging_path = _find_staging_for_session(sid, uid_s)
+        rst.staging_path = _find_staging_for_session(sid)
         if rst.staging_path is None and mpc.BUILTIN_SAVE_SESSION_STAGING:
-            rst.staging_path = _new_staging_path(uid_s, sid)
+            rst.staging_path = _new_staging_path(sid)
         SESSIONS[sid] = rst
         return {
             "session_id": sid,

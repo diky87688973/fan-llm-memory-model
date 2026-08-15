@@ -3,8 +3,6 @@ transformers>=4.44.0
 accelerate>=0.33.0
 peft>=0.12.0
 bitsandbytes>=0.43.0; platform_system != "Darwin"
-trl>=0.9.0
-datasets>=2.20.0
 safetensors>=0.4.0
 sentencepiece>=0.2.0
 protobuf>=4.0.0

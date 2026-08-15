@@ -18,12 +18,11 @@ import argparse
 import json
 import os
 import sys
-import uuid
 from datetime import datetime
 from pathlib import Path
 
 import memory_pipeline_core as mpc
-import memory_user_paths as mem_paths
+from memory_session_id import next_session_id
 
 BUILTIN_CLIENT_PIPELINE_BASE = "http://127.0.0.1:8890"
 
@@ -114,23 +113,14 @@ def main() -> None:
         flush=True,
     )
 
-    uid_raw = (os.environ.get("MEMORY_USER_ID") or "").strip() or mem_paths.generate_new_user_id()
-    uid_s = mem_paths.sanitize_path_user_id(uid_raw)
     staging_log: Path | None = None
-    staging_speaker = (os.environ.get("MEMORY_DISPLAY_NAME") or "User").strip() or "User"
     if mpc.BUILTIN_SAVE_SESSION_STAGING:
-        session_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
-        staging_root = Path(mpc.BUILTIN_SESSION_STAGING_DIR)
-        staging_log = mem_paths.session_staging_user_dir(staging_root, uid_s) / f"session_{session_id}.txt"
+        session_id = next_session_id()
+        staging_log = Path(mpc.BUILTIN_SESSION_STAGING_DIR) / f"cli_{session_id}.txt"
         staging_log.parent.mkdir(parents=True, exist_ok=True)
-        print(
-            f"会话记录 user_id={uid_s} 展示名={staging_speaker!r}: {staging_log}",
-            flush=True,
-        )
+        print(f"会话记录（仅用户输入与最终答复）: {staging_log.name}", flush=True)
 
     history: list[tuple[str, str]] = []
-    session_memory_retrieval_blocks: list[str] = []
-    session_profile_fks: set[str] = set()
     while True:
         try:
             user = input("\n请输入: ").strip()
@@ -161,9 +151,6 @@ def main() -> None:
                     timeout_sec=args.timeout,
                     ollama_think=bool(args.ollama_think),
                     dump_llm_requests=True,
-                    memory_user_id=uid_s,
-                    session_profile_fks=session_profile_fks,
-                    session_memory_retrieval_blocks=session_memory_retrieval_blocks,
                 ):
                     parts.append(piece)
                     sys.stdout.write(piece)
@@ -184,21 +171,12 @@ def main() -> None:
                     timeout_sec=args.timeout,
                     ollama_think=bool(args.ollama_think),
                     dump_llm_requests=True,
-                    memory_user_id=uid_s,
-                    session_profile_fks=session_profile_fks,
-                    session_memory_retrieval_blocks=session_memory_retrieval_blocks,
                 )
                 print("\n【答复】\n" + out, flush=True)
                 print(flush=True)
             history.append((user, out))
             if staging_log is not None:
-                mpc.append_session_staging_turn(
-                    staging_log,
-                    user,
-                    out,
-                    turn_time=turn_time,
-                    user_speaker_label=staging_speaker,
-                )
+                mpc.append_session_staging_turn(staging_log, user, out, turn_time=turn_time)
         except Exception as e:
             print(f"运行出错: {e!r}", flush=True)
 

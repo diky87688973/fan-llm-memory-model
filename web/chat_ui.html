@@ -358,40 +358,9 @@
     }
     #send:hover:not(:disabled) { background: var(--accent-hover); }
     #send:disabled { opacity: 0.45; cursor: not-allowed; }
-    #name-modal {
-      position: fixed; inset: 0; z-index: 9999; display: none; align-items: center; justify-content: center;
-      background: rgba(0,0,0,.72);
-    }
-    #name-modal.show { display: flex; }
-    #name-modal .name-modal-box {
-      width: min(92vw, 22rem); padding: 1.1rem 1.2rem; border-radius: 0.75rem;
-      background: var(--panel); border: 1px solid var(--border); box-shadow: var(--shadow);
-    }
-    #name-modal h3 { margin: 0 0 0.5rem; font-size: 1rem; }
-    #name-modal p { margin: 0 0 0.75rem; font-size: 0.82rem; color: var(--muted); line-height: 1.45; }
-    #name-modal-input {
-      width: 100%; box-sizing: border-box; padding: 0.55rem 0.65rem; border-radius: 0.5rem;
-      border: 1px solid var(--border); background: #121218; color: var(--text); font-size: 0.95rem;
-    }
-    .name-modal-actions { margin-top: 0.85rem; display: flex; justify-content: flex-end; }
-    #name-modal-ok {
-      padding: 0.45rem 1rem; border-radius: 0.5rem; border: none; cursor: pointer; font-weight: 600;
-      background: var(--accent); color: #f4f4f8;
-    }
-    #name-modal-ok:hover { background: var(--accent-hover); }
   </style>
 </head>
 <body>
-  <div id="name-modal" aria-modal="true" role="dialog" aria-labelledby="name-modal-title">
-    <div class="name-modal-box">
-      <h3 id="name-modal-title">设置用户名</h3>
-      <p>将写入会话 staging 与侧车记录，用于区分对话角色；不能为空或全空格。</p>
-      <input id="name-modal-input" type="text" maxlength="48" autocomplete="username" placeholder="例如：张三" />
-      <div class="name-modal-actions">
-        <button type="button" id="name-modal-ok">确定</button>
-      </div>
-    </div>
-  </div>
   <div id="app-shell">
     <nav id="side-nav" aria-label="主导航">
       <button type="button" class="nav-item on" id="nav-chat" data-view="chat">对话</button>
@@ -475,79 +444,6 @@
     const memPreview = document.getElementById("mem-preview");
     const todayFileList = document.getElementById("today-file-list");
     const todayPreview = document.getElementById("today-preview");
-    const nameModal = document.getElementById("name-modal");
-    const nameModalInput = document.getElementById("name-modal-input");
-    const nameModalOk = document.getElementById("name-modal-ok");
-    const CK_UID = "memory_user_id";
-    const CK_DN = "memory_display_name";
-
-    function getCookie(name) {
-      const p = name + "=";
-      const a = document.cookie.split(";");
-      for (let i = 0; i < a.length; i++) {
-        const s = a[i].trim();
-        if (s.startsWith(p)) {
-          try {
-            return decodeURIComponent(s.slice(p.length));
-          } catch (e) {
-            return s.slice(p.length);
-          }
-        }
-      }
-      return "";
-    }
-    function setCookie(name, val, maxAgeSec) {
-      document.cookie =
-        name +
-        "=" +
-        encodeURIComponent(val) +
-        ";path=/;max-age=" +
-        (maxAgeSec || 365 * 86400) +
-        ";SameSite=Lax";
-    }
-    function chatDisplayName() {
-      const s = (getCookie(CK_DN) || "").trim();
-      return s || "我";
-    }
-    function openNameModalOnce() {
-      return new Promise(function (resolve) {
-        nameModalInput.value = getCookie(CK_DN) || "";
-        nameModal.classList.add("show");
-        nameModalInput.focus();
-        function cleanup() {
-          nameModalOk.removeEventListener("click", onOk);
-          nameModalInput.removeEventListener("keydown", onKey);
-        }
-        function done() {
-          const v = (nameModalInput.value || "").trim();
-          if (!v) {
-            window.alert("用户名不能为空或全空格。");
-            return;
-          }
-          setCookie(CK_DN, v);
-          nameModal.classList.remove("show");
-          cleanup();
-          resolve(v);
-        }
-        function onOk() {
-          done();
-        }
-        function onKey(e) {
-          if (e.key === "Enter") {
-            e.preventDefault();
-            done();
-          }
-        }
-        nameModalOk.addEventListener("click", onOk);
-        nameModalInput.addEventListener("keydown", onKey);
-      });
-    }
-    async function ensureUserCookies() {
-      let dn = (getCookie(CK_DN) || "").trim();
-      if (!dn) {
-        await openNameModalOnce();
-      }
-    }
 
     function setMainView(name) {
       const chat = name === "chat";
@@ -571,7 +467,7 @@
       memFileList.innerHTML = "";
       memPreview.textContent = "";
       try {
-        const r = await fetch("/memory-bank/raw-files", { credentials: "same-origin" });
+        const r = await fetch("/memory-bank/raw-files");
         const t = await r.text();
         if (!r.ok) {
           const li = document.createElement("li");
@@ -586,6 +482,13 @@
         const j = JSON.parse(t);
         const arr = j.files || [];
         if (!arr.length) {
+          const li = document.createElement("li");
+          const b = document.createElement("button");
+          b.type = "button";
+          b.disabled = true;
+          b.textContent = "（session_raw 下暂无 .raw.txt）";
+          li.appendChild(b);
+          memFileList.appendChild(li);
           return;
         }
         for (const it of arr) {
@@ -621,8 +524,7 @@
       memPreview.textContent = "加载中…";
       try {
         const r = await fetch(
-          "/memory-bank/raw-content?rel=" + encodeURIComponent(rel),
-          { credentials: "same-origin" }
+          "/memory-bank/raw-content?rel=" + encodeURIComponent(rel)
         );
         const txt = await r.text();
         if (!r.ok) {
@@ -639,7 +541,7 @@
       todayFileList.innerHTML = "";
       todayPreview.textContent = "";
       try {
-        const r = await fetch("/today-sessions", { credentials: "same-origin" });
+        const r = await fetch("/today-sessions");
         const t = await r.text();
         if (!r.ok) {
           const li = document.createElement("li");
@@ -654,6 +556,13 @@
         const j = JSON.parse(t);
         const arr = j.files || [];
         if (!arr.length) {
+          const li = document.createElement("li");
+          const b = document.createElement("button");
+          b.type = "button";
+          b.disabled = true;
+          b.textContent = "（session_staging 下暂无文件）";
+          li.appendChild(b);
+          todayFileList.appendChild(li);
           return;
         }
         for (const it of arr) {
@@ -668,7 +577,7 @@
           btn.type = "button";
           btn.textContent =
             fname + (isCur ? "\n· 当前页会话" : "");
-          btn.title = "session_staging/<用户>/" + fname;
+          btn.title = "session_staging/" + fname;
           btn.dataset.stagingName = fname;
           btn.addEventListener("click", function () {
             selectTodayStagingFile(fname, btn);
@@ -695,8 +604,7 @@
       todayPreview.textContent = "加载中…";
       try {
         const r = await fetch(
-          "/today-session-content?name=" + encodeURIComponent(fname),
-          { credentials: "same-origin" }
+          "/today-session-content?name=" + encodeURIComponent(fname)
         );
         const txt = await r.text();
         if (!r.ok) {
@@ -725,7 +633,7 @@
     async function loadHistoryChatFiles() {
       historyFileList.innerHTML = "";
       try {
-        const r = await fetch("/session-chat/files", { credentials: "same-origin" });
+        const r = await fetch("/session-chat/files");
         const t = await r.text();
         if (!r.ok) {
           const li = document.createElement("li");
@@ -742,6 +650,15 @@
         const j = JSON.parse(t);
         const arr = j.files || [];
         if (!arr.length) {
+          const li = document.createElement("li");
+          li.className = "history-row";
+          const b = document.createElement("button");
+          b.type = "button";
+          b.disabled = true;
+          b.className = "history-open-btn";
+          b.textContent = "（session_chat 下暂无记录）";
+          li.appendChild(b);
+          historyFileList.appendChild(li);
           return;
         }
         for (const it of arr) {
@@ -846,7 +763,6 @@
       try {
         const r = await fetch("/session-chat/open", {
           method: "POST",
-          credentials: "same-origin",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ filename: filename }),
         });
@@ -886,10 +802,8 @@
     function appendUserBubble(text) {
       const row = document.createElement("div");
       row.className = "row-msg user";
-      const nm = chatDisplayName();
-      const av = nm.length ? nm.charAt(0) : "我";
       row.innerHTML =
-        '<div class="avatar me">' + esc(av) + "</div>" +
+        '<div class="avatar me">我</div>' +
         '<div class="bubble">' + esc(text) + "</div>";
       thread.appendChild(row);
       threadShell.scrollTop = threadShell.scrollHeight;
@@ -953,27 +867,13 @@
 
     async function ensureSession() {
       if (sessionId) return;
-      const uid = getCookie(CK_UID);
-      const dn = getCookie(CK_DN);
-      const r = await fetch("/sessions", {
-        method: "POST",
-        credentials: "same-origin",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ user_id: uid, display_name: dn }),
-      });
+      const r = await fetch("/sessions", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
       const t = await r.text();
-      if (!r.ok) {
-        appendError("创建会话失败: " + t);
-        return;
-      }
+      if (!r.ok) { appendError("创建会话失败: " + t); return; }
       try {
         const j = JSON.parse(t);
         sessionId = j.session_id;
-        if (j.user_id) {
-          setCookie(CK_UID, j.user_id);
-        }
-        metaEl.textContent =
-          "session " + sessionId + " · " + chatDisplayName() + " · __CHAT_UI_SUB__";
+        metaEl.textContent = "session " + sessionId + " · __CHAT_UI_SUB__";
         if (j.llm_model) setHeaderLlmModel(j.llm_model);
       } catch (e) {
         appendError("解析会话失败: " + t);
@@ -995,7 +895,6 @@
         try {
           const r = await fetch(url, {
             method: "POST",
-            credentials: "same-origin",
             headers: { "Content-Type": "application/json" },
             body,
           });
@@ -1068,7 +967,6 @@
       try {
         const r = await fetch(url, {
           method: "POST",
-          credentials: "same-origin",
           headers: { "Content-Type": "application/json" },
           body,
         });
@@ -1172,12 +1070,8 @@
       sendOne();
     });
     if (typeof marked !== "undefined") marked.setOptions({ breaks: true, gfm: true });
-    async function bootstrap() {
-      await ensureUserCookies();
-      await ensureSession();
-      setMainView("chat");
-    }
-    bootstrap();
+    ensureSession();
+    setMainView("chat");
   </script>
 </body>
 </html>

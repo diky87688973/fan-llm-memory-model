@@ -1,9 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-记忆抽取：右键运行，终端输入问题；送入模型前 user 侧会自动加 `[记忆提取]` 前缀（与 train_memory 中 QA 训练格式一致），输出与 memory_api_server 的生成逻辑相同。默认与调试相关超参见文首 **HF 与同段内置**；需要完整提示词与原始输出时将 ``BUILTIN_VERBOSE_DEBUG`` 设为 True。
+记忆抽取：右键运行，终端输入问题；送入模型前 user 侧会自动加 `[记忆提取]` 前缀（与 1.0 train_memory 中 QA 训练格式一致），新 API 实现时请保持同一格式。默认与调试超参见文首 **HF 与同段内置**；需要完整提示词与原始输出时将 ``BUILTIN_VERBOSE_DEBUG`` 设为 True。
 
-每轮对话会追加写入 `session_staging/<用户ID>/session_{时间}_{sessionId}.txt`（用户 ID 来自环境变量 ``MEMORY_USER_ID`` 或每次启动新生成），便于整理为 `session/<用户ID>/YYYY-MM-DD/*.raw.txt` 等。
-环境变量 ``MEMORY_DISPLAY_NAME``：写入轮次时的发言者前缀（默认 ``User``）。
+每轮对话会追加写入 `session_staging/cli_{时间}_{sessionId}.txt`（每次启动 CLI 生成一个 sessionId），便于后续整理为 `session_raw/*.raw.txt`、抽取 `*.qa.jsonl` 再训练。
 每轮以 `[轮次时间: YYYY-MM-DD HH:MM:SS]` 记录**用户提交该轮问题时的本地绝对时间**（日期+时分秒，在模型推理前打点），供提纯与 raw「记忆时间」锚点使用。
 
 退出：输入 quit 或 exit（与 GPT-4.1 生成脚本一致）。
@@ -20,12 +19,11 @@ for _sub in ("core", "train", "serve"):
 
 import os
 import sys
-import uuid
 from datetime import datetime
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
-# HF：必须在 import memory_utils 之前（与 memory_api_server / train_memory 一致）
+# HF：必须在 import memory_utils 之前（与 1.0 memory_api_server / train_memory 一致）
 # ---------------------------------------------------------------------------
 BUILTIN_HF_MIRROR = True
 BUILTIN_HF_ENDPOINT = ""
@@ -35,15 +33,13 @@ BUILTIN_HF_DISABLE_SYMLINKS_WARNING = True
 
 # ---------------------------------------------------------------------------
 # 路径与模型内置（与上方 HF 同区；不 import memory_utils）
-# 未设 ``MEMORY_LORA_DIRNAME`` 时与 memory_utils 默认「memory_lora_v2」一致
+# 未设 ``MEMORY_LORA_DIRNAME`` 时与 2.0 memory_utils 默认「memory_lora_v4」一致
 # ---------------------------------------------------------------------------
 _script_dir = Path(__file__).resolve().parent
-BUILTIN_LORA_DIRNAME = (os.environ.get("MEMORY_LORA_DIRNAME", "").strip() or "memory_lora_v2")
+BUILTIN_LORA_DIRNAME = (os.environ.get("MEMORY_LORA_DIRNAME", "").strip() or "memory_lora_v4")
 BUILTIN_HUB_BASE_MODEL = "Qwen/Qwen2.5-7B-Instruct"
 BUILTIN_BASE_MODEL = BUILTIN_HUB_BASE_MODEL
 BUILTIN_ADAPTER_DIR = str(_script_dir / "outputs" / BUILTIN_LORA_DIRNAME)
-# 无代理且镜像 tokenizer 对中文为 0 token 时：将完整 tokenizer 文件放入下目录，或设环境变量 MEMORY_TOKENIZER_PATH
-BUILTIN_LOCAL_TOKENIZER_DIR = str(_script_dir / "hf_tokenizer")
 BUILTIN_NO_4BIT = False
 BUILTIN_MAX_NEW_TOKENS = 512
 BUILTIN_VERBOSE_DEBUG = False
@@ -76,8 +72,7 @@ warnings.filterwarnings("ignore", category=FutureWarning, module="bitsandbytes")
 
 from peft import PeftModel
 
-import memory_user_paths as mem_paths
-
+from memory_session_id import next_session_id
 from memory_utils import (
     build_extract_messages,
     clean_memory_generation_output,
@@ -94,10 +89,9 @@ _device = None
 
 
 def _resolve_local_tokenizer_dir() -> str | None:
+    """2.0 不内置 hf_tokenizer 目录；需要离线 tokenizer 时设置环境变量 MEMORY_TOKENIZER_PATH。"""
     env = os.environ.get("MEMORY_TOKENIZER_PATH", "").strip()
-    if env:
-        return env
-    return BUILTIN_LOCAL_TOKENIZER_DIR
+    return env or None
 
 
 def _load_model(base_model_id: str, adapter_dir: Path, use_4bit: bool) -> None:
@@ -143,12 +137,10 @@ def _append_session_staging_turn(
     assistant_cleaned: str,
     *,
     turn_time: datetime,
-    user_speaker_label: str = "User",
 ) -> None:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     ts = turn_time.replace(microsecond=0).strftime("%Y-%m-%d %H:%M:%S")
-    label = (user_speaker_label or "").strip() or "User"
-    block = f"[轮次时间: {ts}]\n{label}: {user_query}\nAssistant: {assistant_cleaned}\n\n"
+    block = f"[轮次时间: {ts}]\nUser: {user_query}\nAssistant: {assistant_cleaned}\n\n"
     with log_path.open("a", encoding="utf-8") as f:
         f.write(block)
 
@@ -193,7 +185,7 @@ def main() -> None:
     adapter_dir = Path(BUILTIN_ADAPTER_DIR)
     if not adapter_dir.is_dir():
         print(f"错误：适配器目录不存在: {adapter_dir}", flush=True)
-        print("请先运行 train_memory.py 完成训练。", flush=True)
+        print("请将 BUILTIN_ADAPTER_DIR 指向已训练的 LoRA 目录（训练脚本在 记忆模型/1.0/train_memory.py）。", flush=True)
         sys.exit(1)
 
     print("正在加载基座 + LoRA 适配器（首次可能较慢）…", flush=True)
@@ -201,18 +193,11 @@ def main() -> None:
     print("记忆抽取已就绪。输入 quit 或 exit 退出。", flush=True)
 
     staging_log: Path | None = None
-    staging_speaker = (os.environ.get("MEMORY_DISPLAY_NAME") or "User").strip() or "User"
     if BUILTIN_SAVE_SESSION_STAGING:
-        session_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
-        uid_raw = (os.environ.get("MEMORY_USER_ID") or "").strip() or mem_paths.generate_new_user_id()
-        uid_s = mem_paths.sanitize_path_user_id(uid_raw)
-        staging_root = Path(BUILTIN_SESSION_STAGING_DIR)
-        staging_log = mem_paths.session_staging_user_dir(staging_root, uid_s) / f"session_{session_id}.txt"
+        session_id = next_session_id()
+        staging_log = Path(BUILTIN_SESSION_STAGING_DIR) / f"cli_{session_id}.txt"
         staging_log.parent.mkdir(parents=True, exist_ok=True)
-        print(
-            f"sessionId={session_id}  user_id={uid_s}  展示名={staging_speaker!r}  会话记录: {staging_log}",
-            flush=True,
-        )
+        print(f"sessionId={session_id}  会话记录: {staging_log.name}", flush=True)
         if BUILTIN_VERBOSE_DEBUG:
             print(f"完整路径: {staging_log}", flush=True)
 
@@ -232,13 +217,7 @@ def main() -> None:
             turn_time = datetime.now().replace(microsecond=0)
             cleaned = print_extract_round(user)
             if staging_log is not None:
-                _append_session_staging_turn(
-                    staging_log,
-                    user,
-                    cleaned,
-                    turn_time=turn_time,
-                    user_speaker_label=staging_speaker,
-                )
+                _append_session_staging_turn(staging_log, user, cleaned, turn_time=turn_time)
         except Exception as e:
             print(f"生成出错: {e}", flush=True)
 

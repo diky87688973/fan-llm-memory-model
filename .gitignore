@@ -5,34 +5,10 @@ __pycache__/
 .venv/
 venv/
 
-# ── 训练产物 / 大体积数据（勿提交）──
-outputs/
-checkpoints*/
-preprocessed_data*/
-hf_tokenizer/
-qwen_tokenizer/
-*.safetensors
-*.bin
-*.pt
-*.ckpt
-
-# ── 记忆数据（会话/提纯产物）──
+# ── 记忆数据 / 训练产物 ──
 session/
-session_raw/
-session_bak/
-session_chat/
 session_staging/
-*.user.pic.md
-*.raw.txt
-*.qa.jsonl
+outputs/
+*.log
 *.memory.json
 *.memory_decision.txt
-
-# ── 运行时状态 / 日志 ──
-*.log
-.user_id_counter.state
-train_memory_replay_last_error.txt
-
-# ── 密钥（重要：切勿提交真实 API Key）──
-*.key
-.env
